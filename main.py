@@ -18,88 +18,89 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 # ====== 操盘参数 ======
 SYMBOLS = ["BTCUSDT_UMCBL", "ETHUSDT_UMCBL", "SOLUSDT_UMCBL", "BNBUSDT_UMCBL", "XRPUSDT_UMCBL"]
-LEVERAGE = 15             # 枚举 1-50，根据风险偏好调整
-MAX_POS_PCT = 0.20        # 单币最大投入资金比例（20%）
-ORDER_GRID = 3            # 分批建仓笔数
-TAKE_PROFIT = 0.012       # 止盈 1.2%
-STOP_LOSS = 0.007         # 止损 0.7%
+LEVERAGE = 15
+MAX_POS_PCT = 0.20
+ORDER_GRID = 3
+TAKE_PROFIT = 0.012
+STOP_LOSS = 0.007
 
 def notify(msg: str):
     """发送 Telegram 通知"""
     if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         try:
-            requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": msg})
+            requests.post(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                data={"chat_id": TELEGRAM_CHAT_ID, "text": msg},
+                timeout=5
+            )
         except:
             pass
 
-# ====== Bitget 签名工具 ======
-def sign_request(api_secret, timestamp, method, request_path, body=''):
-    prehash = f"{timestamp}{method.upper()}{request_path}{body or ''}"
-    return base64.b64encode(hmac.new(api_secret.encode(), prehash.encode(), hashlib.sha256).digest()).decode()
+# ====== Bitget 签名与请求 ======
+def sign_request(secret, ts, method, path, body=''):
+    prehash = f"{ts}{method.upper()}{path}{body or ''}"
+    return base64.b64encode(hmac.new(secret.encode(), prehash.encode(), hashlib.sha256).digest()).decode()
 
-def get_headers(method, request_path, body=''):
-    timestamp = str(int(time.time() * 1000))
-    signature = sign_request(BITGET_API_SECRET, timestamp, method, request_path, body)
+def get_headers(method, path, body=''):
+    ts = str(int(time.time() * 1000))
+    sig = sign_request(BITGET_API_SECRET, ts, method, path, body)
     return {
         "ACCESS-KEY": BITGET_API_KEY,
-        "ACCESS-SIGN": signature,
-        "ACCESS-TIMESTAMP": timestamp,
+        "ACCESS-SIGN": sig,
+        "ACCESS-TIMESTAMP": ts,
         "ACCESS-PASSPHRASE": BITGET_API_PASSPHRASE,
         "Content-Type": "application/json"
     }
 
 def bitget_get(path):
-    url = "https://api.bitget.com" + path
-    return requests.get(url, headers=get_headers("GET", path), timeout=10).json()
+    return requests.get("https://api.bitget.com" + path, headers=get_headers("GET", path), timeout=10).json()
 
 def bitget_post(path, payload):
-    url = "https://api.bitget.com" + path
     body = json.dumps(payload)
-    return requests.post(url, headers=get_headers("POST", path, body), data=body, timeout=10).json()
+    return requests.post("https://api.bitget.com" + path, headers=get_headers("POST", path, body), data=body, timeout=10).json()
 
-# ====== 数据获取函数 ======
+# ====== 数据获取函数（已修复空值判断） ======
 def get_account_equity() -> float:
-    """获取账户 USDT 权益"""
+    """获取账户 USDT 权益，支持空值保护"""
     path = "/api/mix/v1/account/accounts?productType=umcbl"
+    res = bitget_get(path)
+    data = res.get("data") if isinstance(res, dict) else None
+    if not data or not isinstance(data, list):
+        notify(f"⚠️ 获取账户权益接口返回异常: {res}")
+        return 0.0
     try:
-        data = bitget_get(path)['data'][0]
-        return float(data['usdtEquity'])
+        return float(data[0].get("usdtEquity", 0))
     except Exception as e:
-        notify(f"⚠️ 无法获取账户权益: {e}")
+        notify(f"⚠️ 解析账户权益失败: {e}")
         return 0.0
 
 def get_last_price(symbol: str) -> float:
-    """获取合约最新价"""
     path = f"/api/mix/v1/market/ticker?symbol={symbol}&productType=umcbl"
     try:
         return float(requests.get("https://api.bitget.com" + path, timeout=8).json()['data']['last'])
     except Exception as e:
-        notify(f"⚠️ 获取 {symbol} 最新价失败: {e}")
+        notify(f"⚠️ 获取{symbol}最新价失败: {e}")
         return None
 
 def get_ohlc(symbol: str, limit: int = 60) -> list:
-    """获取指定合约分钟 K 线收盘价数组"""
     path = f"/api/mix/v1/market/candles?symbol={symbol}&granularity=60&limit={limit}"
     try:
         arr = requests.get("https://api.bitget.com" + path, timeout=8).json().get('data', [])
-        return [float(candle[4]) for candle in arr[::-1]]
+        return [float(c[4]) for c in arr[::-1]]
     except Exception as e:
-        notify(f"⚠️ 获取 {symbol} K 线失败: {e}")
+        notify(f"⚠️ 获取{symbol}K线失败: {e}")
         return None
 
 def get_position(symbol: str) -> dict:
-    """查询当前持仓"""
     path = f"/api/mix/v1/position/singlePosition?symbol={symbol}&marginCoin=USDT"
     try:
-        return bitget_get(path)['data']
+        return bitget_get(path).get('data', {})
     except Exception as e:
-        notify(f"⚠️ 查询 {symbol} 持仓失败: {e}")
+        notify(f"⚠️ 查询{symbol}持仓失败: {e}")
         return {}
 
 # ====== 下单与平仓 ======
 def place_order(symbol: str, side: str, size: float, leverage: int):
-    """市价开/平仓，side 支持 open_long/open_short/close_long/close_short"""
     path = "/api/mix/v1/order/placeOrder"
     payload = {
         "symbol": symbol,
@@ -118,7 +119,6 @@ def place_order(symbol: str, side: str, size: float, leverage: int):
         notify(f"❌ 下单失败 {symbol} {side}: {e}")
 
 def close_all_positions(symbol: str):
-    """一鍵平掉所有该合约持仓"""
     pos = get_position(symbol)
     total = float(pos.get('total', 0))
     if total:
@@ -127,7 +127,6 @@ def close_all_positions(symbol: str):
 
 # ====== AI 策略判断 ======
 def ai_signal(symbol: str, closes: list) -> str:
-    """示例多因子策略：短均突破 + ATR 动量判断"""
     arr = np.array(closes)
     ma20 = arr[-20:].mean()
     ma5  = arr[-5:].mean()
@@ -150,7 +149,7 @@ def ai_trader():
         unit = round((equity * MAX_POS_PCT) / ORDER_GRID, 4)
         for symbol in SYMBOLS:
             price = get_last_price(symbol)
-            if not price: 
+            if not price:
                 continue
             closes = get_ohlc(symbol, 60)
             if not closes:
@@ -159,14 +158,11 @@ def ai_trader():
             pos = get_position(symbol)
             has_pos = float(pos.get('total', 0)) != 0
             msg = f"{symbol} 现价:{price:.2f} 信号:{signal} 权益:{equity:.2f} 单笔:{unit}"
-            
-            # 开仓
             if signal in ["open_long","open_short"] and not has_pos:
                 notify(f"🟢 开仓信号→ {msg}")
                 for _ in range(ORDER_GRID):
                     place_order(symbol, signal, unit, LEVERAGE)
                     time.sleep(1)
-            # 止盈止损
             elif has_pos:
                 entry = float(pos.get('openPriceAvg', price))
                 side  = pos.get('holdSide')
@@ -191,5 +187,6 @@ def ai_trader():
 
 if __name__ == "__main__":
     ai_trader()
+
 
 
