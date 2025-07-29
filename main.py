@@ -27,4 +27,7 @@ def start_trading():
 
 if __name__ == "__main__":
     start_trading()
+import time
+while True:
+    time.sleep(60)
 
