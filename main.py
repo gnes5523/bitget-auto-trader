@@ -4,11 +4,9 @@ import os
 import time
 import threading
 import requests
-import json
 import hmac
 import hashlib
 import base64
-import uuid
 import numpy as np
 import pandas as pd
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -31,7 +29,7 @@ LIMIT_15M    = 50
 MA_SHORT     = 5
 MA_LONG      = 20
 RISK_PCT     = 0.01       # 每次交易风险占权益的 1%
-INTERVAL     = 60 * 5     # 每5分钟推送一次
+INTERVAL     = 60         # 测试用：每 1 分钟推送一次
 
 # ———— HTTP 健康检查服务 ————
 class HealthHandler(BaseHTTPRequestHandler):
@@ -39,6 +37,10 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.end_headers()
         self.wfile.write(b"OK")
+    def do_HEAD(self):
+        # Render 会发 HEAD 请求
+        self.send_response(200)
+        self.end_headers()
 
 def start_health_server():
     port = int(os.getenv("PORT", "10000"))
@@ -48,12 +50,14 @@ def start_health_server():
 
 # ———— 通用函数 ————
 def notify(text: str):
+    """发送 Telegram 通知"""
     if not TELEBOT or not CHAT_ID:
         return
     try:
         requests.post(
             f"https://api.telegram.org/bot{TELEBOT}/sendMessage",
-            data={"chat_id": CHAT_ID, "text": text}, timeout=5
+            data={"chat_id": CHAT_ID, "text": text},
+            timeout=5
         )
     except:
         pass
@@ -80,6 +84,7 @@ def bitget_get(path):
                         headers=get_headers("GET",path), timeout=8).json()
 
 def get_account_equity() -> float:
+    """读取 USDT 永续合约账户权益"""
     path = "/api/mix/v1/account/accounts?productType=umcbl"
     res  = bitget_get(path)
     data = res.get("data")
@@ -88,14 +93,17 @@ def get_account_equity() -> float:
     return float(data[0].get("usdtEquity", 0) or 0)
 
 def fetch_closes(symbol: str, granularity: str, limit: int) -> list:
+    """从 Bitget V2 接口拉 K 线，返回升序收盘价列表"""
     url = (
         "https://api.bitget.com"
         f"/api/v2/mix/market/candles"
-        f"?symbol={symbol}&productType={PRODUCT}"
-        f"&granularity={granularity}&limit={limit}"
+        f"?symbol={symbol}"
+        f"&productType={PRODUCT}"
+        f"&granularity={granularity}"
+        f"&limit={limit}"
     )
     try:
-        j = requests.get(url, timeout=8).json()
+        j   = requests.get(url, timeout=8).json()
         arr = j.get("data") or []
     except:
         return []
@@ -108,6 +116,17 @@ def fetch_closes(symbol: str, granularity: str, limit: int) -> list:
     return closes
 
 def compute_signal(sym: str, c1: list, c15: list, equity: float) -> dict:
+    """
+    多因子信号 + 动态杠杆 + 1% 风险资金管理
+    返回字典：
+      signal: 'long'/'short'/'wait'
+      price: float
+      leverage: int
+      entry: float
+      tp: float
+      sl: float
+      qty: float
+    """
     arr1, arr15 = np.array(c1), np.array(c15)
     price       = arr1[-1]
     atr1        = np.mean(np.abs(arr1[1:] - arr1[:-1])) + 1e-8
@@ -119,14 +138,15 @@ def compute_signal(sym: str, c1: list, c15: list, equity: float) -> dict:
     rsi14 = 100 - 100/(1 + (up[-14:].mean()/(down[-14:].mean()+1e-8)))
 
     # MACD on 15m
-    ema12 = pd.Series(arr15).ewm(span=12).mean().to_numpy()
-    ema26 = pd.Series(arr15).ewm(span=26).mean().to_numpy()
+    ema12     = pd.Series(arr15).ewm(span=12).mean().to_numpy()
+    ema26     = pd.Series(arr15).ewm(span=26).mean().to_numpy()
     macd_line = ema12 - ema26
     sig_line  = pd.Series(macd_line).ewm(span=9).mean().to_numpy()
     hist      = macd_line - sig_line
     macd_hist = hist[-1]
 
-    high15, low15 = arr15[-MA_LONG:].max(), arr15[-MA_LONG:].min()
+    high15 = arr15[-MA_LONG:].max()
+    low15  = arr15[-MA_LONG:].min()
 
     # 决策
     signal = "wait"
@@ -142,28 +162,28 @@ def compute_signal(sym: str, c1: list, c15: list, equity: float) -> dict:
     tp = price + (2*atr1 if signal=="long" else -2*atr1)
     sl = price - (1*atr1 if signal=="long" else -1*atr1)
 
-    # 头寸规模：风险1%权益 / 止损距离
-    risk    = equity * RISK_PCT
-    distance= abs(price-sl)
-    qty     = round(risk/distance, 4)
+    # 头寸规模：风险1%权益 / 距离
+    risk     = equity * RISK_PCT
+    distance = abs(price-sl)
+    qty      = round(risk/distance, 4)
 
     return {
         "signal":   signal,
-        "price":    round(price,4),
+        "price":    round(price, 4),
         "leverage": lev,
-        "entry":    round(price,4),
-        "tp":       round(tp,4),
-        "sl":       round(sl,4),
+        "entry":    round(price, 4),
+        "tp":       round(tp, 4),
+        "sl":       round(sl, 4),
         "qty":      qty
     }
 
 def trader_loop():
-    notify("🤖【顶尖信号 V2】启动：含资金管理 · 10 币种 · 每 5 分钟")
+    notify("🤖【顶尖信号 V2】启动(test)：10 币种 ∙ 每 1 分钟")
     while True:
-        equity = get_account_equity()
-        if equity<=0:
-            time.sleep(30)
-            continue
+        # 测试模式：拿不到真实权益时用 1000 USDT
+        equity = get_account_equity() or 1000
+        # 调试通知
+        notify(f"🔄 新一轮信号计算，Equity={equity}")
 
         for sym in SYMBOLS:
             c1  = fetch_closes(sym, GRAN_1M,  LIMIT_1M)
@@ -173,28 +193,30 @@ def trader_loop():
 
             info = compute_signal(sym, c1, c15, equity)
             s    = info["signal"]
+
             if s=="long":
                 txt = (
-                    f"🚀 [{sym}] 开多\n"
-                    f"现价 {info['price']}, 进场 {info['entry']}\n"
-                    f"杠杆 x{info['leverage']}, 数量 {info['qty']} 张\n"
-                    f"止盈 {info['tp']} 止损 {info['sl']}"
+                    f"🚀 [{sym}] 建议多单\n"
+                    f"现价{info['price']} 进场{info['entry']}\n"
+                    f"杠杆x{info['leverage']} 张数{info['qty']}\n"
+                    f"止盈{info['tp']} 止损{info['sl']}"
                 )
             elif s=="short":
                 txt = (
-                    f"🛑 [{sym}] 开空\n"
-                    f"现价 {info['price']}, 进场 {info['entry']}\n"
-                    f"杠杆 x{info['leverage']}, 数量 {info['qty']} 张\n"
-                    f"止盈 {info['tp']} 止损 {info['sl']}"
+                    f"🛑 [{sym}] 建议空单\n"
+                    f"现价{info['price']} 进场{info['entry']}\n"
+                    f"杠杆x{info['leverage']} 张数{info['qty']}\n"
+                    f"止盈{info['tp']} 止损{info['sl']}"
                 )
             else:
-                txt = f"⏸️ [{sym}] 观望 现价 {info['price']}"
+                txt = f"⏸️ [{sym}] 观望 现价{info['price']}"
 
             notify(txt)
             time.sleep(1)
+
         time.sleep(INTERVAL)
 
 if __name__ == "__main__":
-    # 并行启动内置HTTP健康检查 + 交易循环
+    # 并行启动健康检查 + 主循环
     threading.Thread(target=start_health_server, daemon=True).start()
     trader_loop()
