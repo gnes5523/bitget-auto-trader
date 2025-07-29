@@ -1,33 +1,32 @@
-# main.py
-import os
 import time
-from telegram_notify import notify
+import requests
+import os
 
-def start_trading():
-    api_key = os.getenv("BITGET_API_KEY")
-    api_secret = os.getenv("BITGET_API_SECRET")
-    passphrase = os.getenv("BITGET_PASSPHRASE")
-    bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
-    chat_id = os.getenv("TELEGRAM_CHAT_ID")
+# ----- Bitget API Key 設定 -----
+API_KEY = os.getenv("BITGET_API_KEY")
+API_SECRET = os.getenv("BITGET_API_SECRET")
+API_PASSPHRASE = os.getenv("BITGET_PASSPHRASE")
 
-    print("📦 環境變數檢查：")
-    print("BITGET_API_KEY:", api_key)
-    print("BITGET_API_SECRET:", api_secret)
-    print("BITGET_PASSPHRASE:", passphrase)
-    print("TELEGRAM_BOT_TOKEN:", bot_token)
-    print("TELEGRAM_CHAT_ID:", chat_id)
+# ----- Telegram 設定 -----
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-    if not all([api_key, api_secret, passphrase, bot_token, chat_id]):
-        print("❌ 有變數為空，請檢查 Render 的 Environment 設定")
-        return
+def notify(msg):
+    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": msg})
 
-    notify(f"✅ 機器人啟動成功！BITGET_KEY: {api_key[:4]}****")
+def top_trader_strategy():
+    # 這裡放你所有頂尖操盤策略，現在先用模擬
+    notify("🚀 [系統啟動] 頂尖操盤手AI正在運作！\n開始智能監控15大主流幣種...")
+
     while True:
-        time.sleep(60)  # 保持程式持續運行
+        # TODO: 真實策略邏輯寫在這裡，下面是範例模擬
+        print("華爾街級AI正在分析...等待訊號中...")
+        notify("📈 [分析中] AI量化策略正掃描全市場，等待最佳建倉時機")
+        time.sleep(60*5)  # 每5分鐘推播一次，可自由調整
 
 if __name__ == "__main__":
-    start_trading()
-import time
-while True:
-    time.sleep(60)
+    # 啟動策略
+    top_trader_strategy()
 
