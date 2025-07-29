@@ -1,14 +1,8 @@
 # main.py
 
-import os
-import time
-import threading
-import requests
-import hmac
-import hashlib
-import base64
-import numpy as np
-import pandas as pd
+import os, time, threading
+import requests, hmac, hashlib, base64, json, uuid
+import numpy as np, pandas as pd, ccxt
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # ———— 环境变量 ————
@@ -18,187 +12,140 @@ BITGET_API_PASSPHRASE = os.getenv("BITGET_API_PASSPHRASE")
 TELEBOT               = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID               = os.getenv("TELEGRAM_CHAT_ID")
 
-# ———— 策略参数 ————
-SYMBOLS      = ["BTCUSDT","ETHUSDT","SOLUSDT","BNBUSDT","XRPUSDT",
-                "ADAUSDT","MATICUSDT","DOGEUSDT","LINKUSDT","AVAXUSDT"]
-PRODUCT      = "usdt-futures"
-GRAN_1M      = "1m"
-GRAN_15M     = "15m"
-LIMIT_1M     = 50
-LIMIT_15M    = 50
-MA_LONG      = 20
-RISK_PCT     = 0.01       # 每次交易风险占权益的 1%
-INTERVAL     = 60 * 5     # 正式每 5 分钟推送一次
+# ———— 策略／回测参数 ————
+SYMBOLS      = ["BTC/USDT","ETH/USDT","SOL/USDT","BNB/USDT","XRP/USDT",
+                "ADA/USDT","MATIC/USDT","DOGE/USDT","LINK/USDT","AVAX/USDT"]
+TIMEFRAME    = '1m'
+SINCE_DAYS   = 30          # 回测近30天
+GRID_PARAMS  = {
+    'bb_mul':[1.5,2.0,2.5],
+    'rsi_hi':[70,80],
+    'rsi_lo':[30,20],
+    'adx_th':[20,25,30]
+}
+LIVE_INTERVAL= 60*5        # 线上每5分钟推送一次
 
-# ———— HTTP 健康检查服务 ————
+# ———— CCXT 初始化 ————
+exchange = ccxt.binance({
+    'enableRateLimit': True
+})
+
+# ———— HTTP 健康检查 ————
 class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"OK")
     def do_HEAD(self):
-        self.send_response(200)
-        self.end_headers()
+        self.send_response(200); self.end_headers()
+    def do_GET(self):
+        self.send_response(200); self.end_headers(); self.wfile.write(b'OK')
 
 def start_health_server():
-    port = int(os.getenv("PORT", "10000"))
-    server = HTTPServer(("0.0.0.0", port), HealthHandler)
-    server.serve_forever()
+    port= int(os.getenv("PORT","10000"))
+    HTTPServer(('0.0.0.0',port),HealthHandler).serve_forever()
 
-# ———— 通用函数 ————
-def notify(text: str):
-    if not TELEBOT or not CHAT_ID:
-        return
+# ———— 通用推送 ————
+def notify(msg):
+    if not TELEBOT or not CHAT_ID: return
     try:
-        requests.post(
-            f"https://api.telegram.org/bot{TELEBOT}/sendMessage",
-            data={"chat_id": CHAT_ID, "text": text},
-            timeout=5
-        )
-    except:
-        pass
+        requests.post(f"https://api.telegram.org/bot{TELEBOT}/sendMessage",
+                      data={"chat_id":CHAT_ID,"text":msg},timeout=5)
+    except: pass
 
-def sign_request(secret, ts, method, path, body=""):
-    prehash = f"{ts}{method.upper()}{path}{body or ''}"
-    return base64.b64encode(
-        hmac.new(secret.encode(), prehash.encode(), hashlib.sha256).digest()
-    ).decode()
+# ———— 拉历史K线 ————
+def fetch_ohlcv(symbol, since, limit=1000):
+    # symbol 格式 'BTC/USDT'
+    return exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, since=since, limit=limit)
 
-def get_headers(method, path, body=""):
-    ts  = str(int(time.time()*1000))
-    sig = sign_request(BITGET_API_SECRET, ts, method, path, body)
-    return {
-        "ACCESS-KEY": BITGET_API_KEY,
-        "ACCESS-SIGN": sig,
-        "ACCESS-TIMESTAMP": ts,
-        "ACCESS-PASSPHRASE": BITGET_API_PASSPHRASE,
-        "Content-Type": "application/json"
-    }
+# ———— 回测网格搜索 ————
+def optimize_params(symbol):
+    now = exchange.milliseconds()
+    since = now - SINCE_DAYS*24*3600*1000
+    ohlcv = fetch_ohlcv(symbol, since, limit= SINCE_DAYS*24*60)
+    df = pd.DataFrame(ohlcv, columns=['ts','o','h','l','c','v'])
+    df['close']=df['c']
+    best = (0, None)
+    for bb_mul in GRID_PARAMS['bb_mul']:
+      for rsi_hi in GRID_PARAMS['rsi_hi']:
+        for rsi_lo in GRID_PARAMS['rsi_lo']:
+          for adx_th in GRID_PARAMS['adx_th']:
+            # 计算信号
+            df2 = compute_signals(df, bb_mul, rsi_hi, rsi_lo, adx_th)
+            wr = backtest(df2)
+            if wr > best[0]:
+                best = (wr, {'bb_mul':bb_mul,'rsi_hi':rsi_hi,'rsi_lo':rsi_lo,'adx_th':adx_th})
+    return best[1]
 
-def bitget_get(path):
-    return requests.get("https://api.bitget.com"+path,
-                        headers=get_headers("GET",path), timeout=8).json()
+# ———— 信号计算 & 回测函数 ————
+def compute_signals(df, bb_mul, rsi_hi, rsi_lo, adx_th):
+    # 布林带
+    df['ma20']=df['close'].rolling(20).mean()
+    df['sd20']=df['close'].rolling(20).std()
+    df['upper']=df['ma20']+bb_mul*df['sd20']
+    df['lower']=df['ma20']-bb_mul*df['sd20']
+    # RSI
+    d = df['close'].diff()
+    up = d.clip(lower=0); down = -d.clip(upper=0)
+    df['rsi']=100-100/(1+up.rolling(14).mean()/down.rolling(14).mean())
+    # ADX
+    df['tr']=np.maximum.reduce([df['h']-df['l'],(df['h']-df['c'].shift()).abs(),(df['l']-df['c'].shift()).abs()])
+    df['+dm']=np.where((df['h']-df['h'].shift())>(df['l'].shift()-df['l']),df['h']-df['h'].shift(),0)
+    df['-dm']=np.where((df['l'].shift()-df['l'])>(df['h']-df['h'].shift()),df['l'].shift()-df['l'],0)
+    atr= df['tr'].rolling(14).mean()
+    plus= df['+dm'].rolling(14).mean()/atr*100
+    minus= df['-dm'].rolling(14).mean()/atr*100
+    df['adx']=abs(plus-minus)/(plus+minus)*100
+    # 信号
+    df['signal']=0
+    df.loc[(df['close']>df['upper'])&(df['rsi']<rsi_hi)&(df['adx']>adx_th),'signal']=1
+    df.loc[(df['close']<df['lower'])&(df['rsi']>rsi_lo)&(df['adx']>adx_th),'signal']=-1
+    return df
 
-def get_account_equity() -> float:
-    path = "/api/mix/v1/account/accounts?productType=umcbl"
-    res  = bitget_get(path)
-    data = res.get("data")
-    if not isinstance(data, list) or not data:
-        return 0.0
-    return float(data[0].get("usdtEquity", 0) or 0)
+def backtest(df):
+    entry=0;wins=0;trades=0
+    for i in range(len(df)-1):
+        sig=df['signal'].iat[i]
+        price=df['close'].iat[i]
+        if entry==0 and sig!=0:
+            entry=price*sig
+        elif entry!=0 and sig==0:
+            trades+=1
+            exitp=df['close'].iat[i-1]*np.sign(entry)
+            if exitp*entry>0: wins+=1
+            entry=0
+    return wins/trades if trades else 0
 
-def fetch_closes(symbol: str, granularity: str, limit: int) -> list:
-    url = (
-        "https://api.bitget.com"
-        f"/api/v2/mix/market/candles"
-        f"?symbol={symbol}"
-        f"&productType={PRODUCT}"
-        f"&granularity={granularity}"
-        f"&limit={limit}"
-    )
-    try:
-        j   = requests.get(url, timeout=8).json()
-        arr = j.get("data") or []
-    except:
-        return []
-    closes = []
-    for c in arr[::-1]:
-        try:
-            closes.append(float(c[4]))
-        except:
-            continue
-    return closes
-
-def compute_signal(sym: str, c1: list, c15: list, equity: float) -> dict:
-    arr1, arr15 = np.array(c1), np.array(c15)
-    price       = arr1[-1]
-    atr1        = np.mean(np.abs(arr1[1:] - arr1[:-1])) + 1e-8
-
-    # RSI14
-    delta = np.diff(arr1)
-    up    = np.where(delta>0, delta, 0)
-    down  = np.where(delta<0, -delta, 0)
-    rsi14 = 100 - 100/(1 + (up[-14:].mean()/(down[-14:].mean()+1e-8)))
-
-    # MACD on 15m
-    ema12     = pd.Series(arr15).ewm(span=12).mean().to_numpy()
-    ema26     = pd.Series(arr15).ewm(span=26).mean().to_numpy()
-    macd_line = ema12 - ema26
-    sig_line  = pd.Series(macd_line).ewm(span=9).mean().to_numpy()
-    hist      = macd_line - sig_line
-    macd_hist = hist[-1]
-
-    high15 = arr15[-MA_LONG:].max()
-    low15  = arr15[-MA_LONG:].min()
-
-    # 决策
-    signal = "wait"
-    if price > high15 and macd_hist > 0 and rsi14 < 70:
-        signal = "long"
-    elif price < low15 and macd_hist < 0 and rsi14 > 30:
-        signal = "short"
-
-    # 动态杠杆
-    lev = int(max(5, min(50, (1/atr1)*2)))
-
-    # 止盈止损
-    tp = price + (2*atr1 if signal=="long" else -2*atr1)
-    sl = price - (1*atr1 if signal=="long" else -1*atr1)
-
-    # 头寸规模：风险1%权益 / 止损距离
-    risk     = equity * RISK_PCT
-    distance = abs(price - sl)
-    qty      = round(risk/distance, 4)
-
-    return {
-        "signal":   signal,
-        "price":    round(price, 4),
-        "leverage": lev,
-        "entry":    round(price, 4),
-        "tp":       round(tp, 4),
-        "sl":       round(sl, 4),
-        "qty":      qty
-    }
-
-def trader_loop():
-    notify("🤖【顶尖信号 V2】启动：10 币种 ∙ 每 5 分钟")
+# ———— 线上信号循环 ————
+def live_loop(all_params):
+    notify(f"🤖【全市场信号】启动，最佳参数已加载，{len(SYMBOLS)} 币种·{TIMEFRAME}")
     while True:
-        equity = get_account_equity()
-        if equity <= 0:
-            time.sleep(30)
-            continue
-
         for sym in SYMBOLS:
-            c1  = fetch_closes(sym, GRAN_1M,  LIMIT_1M)
-            c15 = fetch_closes(sym, GRAN_15M, LIMIT_15M)
-            if len(c1) < MA_LONG or len(c15) < MA_LONG:
-                continue
-
-            info = compute_signal(sym, c1, c15, equity)
-            s    = info["signal"]
-
-            if s == "long":
-                txt = (
-                    f"🚀 [{sym}] 建议多单\n"
-                    f"现价{info['price']} 进场{info['entry']}\n"
-                    f"杠杆x{info['leverage']} 张数{info['qty']}\n"
-                    f"止盈{info['tp']} 止损{info['sl']}"
-                )
-            elif s == "short":
-                txt = (
-                    f"🛑 [{sym}] 建议空单\n"
-                    f"现价{info['price']} 进场{info['entry']}\n"
-                    f"杠杆x{info['leverage']} 张数{info['qty']}\n"
-                    f"止盈{info['tp']} 止损{info['sl']}"
-                )
-            else:
-                txt = f"⏸️ [{sym}] 观望 现价{info['price']}"
-
+            params = all_params.get(sym)
+            if not params: continue
+            # 拉实时1m & 15m
+            o1=fetch_ohlcv(sym,exchange.milliseconds()-60*1000,limit=MA_LONG*2)
+            o15=fetch_ohlcv(sym,exchange.milliseconds()-15*60*1000,limit=MA_LONG*2)
+            closes1 = np.array([x[4] for x in o1])
+            closes15= np.array([x[4] for x in o15])
+            # 复用compute_signals只取signal
+            df_dummy=pd.DataFrame({'close':closes1,'h':closes15,'l':closes15})
+            sig_df=compute_signals(df_dummy, **params)
+            sig=sig_df['signal'].iat[-1]
+            price=closes1[-1]
+            txt = {
+              1: f"🚀 [{sym}] 建议→开多 价{price:.2f} 杠{params['bb_mul']}",
+             -1: f"🛑 [{sym}] 建议→开空 价{price:.2f} 杠{params['bb_mul']}",
+              0: f"⏸️ [{sym}] 观望 价{price:.2f}"
+            }[sig]
             notify(txt)
             time.sleep(1)
+        time.sleep(LIVE_INTERVAL)
 
-        time.sleep(INTERVAL)
-
-if __name__ == "__main__":
-    threading.Thread(target=start_health_server, daemon=True).start()
-    trader_loop()
+if __name__=='__main__':
+    # 1. 参数优化（大数据回测）
+    all_params={}
+    for sym in SYMBOLS:
+        notify(f"🔍 回测优化 {sym} …")
+        best = optimize_params(sym)
+        all_params[sym]=best
+        notify(f"✅ {sym} 参数: {best}")
+    # 2. 并行启动健康检查 + 实盘信号
+    threading.Thread(target=start_health_server,daemon=True).start()
+    live_loop(all_params)
